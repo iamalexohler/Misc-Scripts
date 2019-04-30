@@ -1,0 +1,567 @@
+---
+title: "LA County Propensity Score"
+author: "Ryan Shields"
+date: "March 26, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+### Packages Required for Completion
+
+- MatchIt is the main package we will be using for
+- Matching is useful for similar functions as MatchIt
+- MatchItSe is a method for evaluating standard error for matchit objects.
+- dyplr is generally usefull and also controls lapply and looping functions for generating multiple plots.
+- gpplot2 for plotting graphs
+- ff for memory optimization for handling large files and reducing error of handling size.
+- wfe for Difference in Difference
+- RStata for writing Stata functions. 
+```{r, message=FALSE, warning=FALSE}
+library(Matching)
+library(MatchIt)
+library(MatchItSE)
+library(dplyr)
+library(ggplot2)
+library(ff)
+library(wfe)
+library(RStata)
+library(twang)
+```
+
+# Read in DataFile and Data Cleaning
+
+### Load in CSV
+
+Grab the output of data from the following GITHUB Code:
+```{r, message=FALSE, warning=FALSE}
+setwd("C:/users/DS049709/Desktop")
+
+Target<- read.csv("LAC Managed HealthNet 90.csv")
+Control<- read.csv("LAC NM HealthNet 90.csv")
+
+#Target<- read.csv("LAC_CA_M_HEALTHNET_EXCLUDED.csv")
+#Control<- read.csv("LAC_CA_NM_HEALTHNET_EXCLUDED.csv")
+
+#Target<- read.csv("LAC_CA Feb_1_M.csv")
+#Control<- read.csv("LAC_CA Feb_1_NM.csv")
+
+#Target<- read.csv("LAC_CA Past_Managed_Encounter.csv")
+#Control<- read.csv("LAC_CA Past_NM_Encounter.csv")
+
+#Target<- read.csv("LAC_CA Past_Managed.csv")
+#Control<- read.csv("LAC_CA Past_NM.csv")
+
+#Target<- read.csv("LAC_Target_Population.csv")
+#Control<- read.csv("LAC_Control_Population.csv")
+```
+
+# Data Cleaning
+
+Currently more than one case can be managed. Get the first case for the non-managed empi's and the first managed case for the managed population.
+```{r}
+#Target Population First Case
+Target.agg <- aggregate(managed_case ~ empi_id, Target, min)
+Target_One_Case <- merge(Target.agg, Target)
+
+#Control Population First Case
+Control.agg <- aggregate(managed_case ~ empi_id, Control, min)
+Control_One_Case <- merge(Control.agg, Control)
+
+#Add managed Variable
+Target_One_Case$managed <- as.integer(1)
+Control_One_Case$managed <- as.integer(0)
+
+#Union
+Propensity <- union(Target_One_Case, Control_One_Case)
+```
+
+Fix the issue with individuals being able to have a defined and undefined race by recoding Race
+```{r}
+Propensity$Race_Sum <- rowSums(Propensity[,c("American_Indian", "Asian", "Black", "Caucasian", "Hispanic", "Pacific_Islander")])
+
+df <- within(Propensity, Unknown[Unknown == 1 & Race_Sum == 1] <- 0)
+```
+
+Issue with 5 more lines than expected, 2 with gender issues, one with race: Turns out to be duplicate marital statuses. Re-run if you think you may have more than 1 line per empi_id
+```{r}
+#Check to see if unique empi's is less than total values in df
+n_occur <- data.frame(table(df$empi_id))
+```
+
+Use Dplyer Function to get of by maxing the marital status and value. 
+```{r}
+# Use Dplyer Function to get one line per empi by maxing the marital status and value. 
+df <- df %>% group_by(episode_of_care_id) %>% top_n(1, Marital_Status)
+df <- df %>% group_by(episode_of_care_id) %>% top_n(1, gender_display)
+
+#Issue with one row seperate lines in Caucasian and Hispanic (Prioritize minority race)
+df <- df %>% group_by(episode_of_care_id) %>% top_n(1, Hispanic)
+
+#Validate, make sure that df has the same number of observations as n_occur now. 
+```
+
+Reduce Data Frame
+```{r, message=FALSE, warning=FALSE}
+# Only Grab Rows that are required for Propensity score and D-I-D
+prop <- df[c(37,1,4,5,6,7,8,9,10,11,12,13,20,26,27,28,29,30,31,32,33,34,35,36)]
+test <- df[c(37,4,5,6,7,8,9,10,11,12,13,20,26,27,28,29,30,31,32,33,34,35,36)]
+
+# Replace Missing Values With 0's, you cannot pace null values into a matchIt object
+prop[is.na(prop)] <- 0
+test[is.na(test)] <- 0
+
+write.csv(prop, file = "C:/users/DS049709/Desktop/Prop.csv")
+```
+
+### Correlation Matrix
+```{r, message=FALSE, warning=FALSE}
+cor_mat <-test
+cor_mat <- setNames(cor_mat, c("managed","age","Marital_Status","gender_display","American_Indian","Asian","Black","Caucasian","Hispanic","Pacific_Islander","Unknown","Identified_Algorithm","chronic_condition_total","physical_condition_present","mental_condition_present","Pre_Emergency","Pre_Outpatient","Pre_Inpatient","Pre_Observation","Post_Emergency","Post_Outpatient","Post_Inpatient","Post_Observation"))
+
+
+mc_data <- cor_mat[,1:length(cor_mat)]
+round(cor(mc_data),2)
+round(cov(mc_data),2)
+```
+
+# Initial Statistics 
+
+### Mean & Std.Error of Total Score
+```{r}
+prop.test <- na.omit(prop) #Omit Null Values
+
+prop.test %>%
+  group_by(managed) %>%
+  summarise(n_patients = n(),
+            mean_score = mean(chronic_condition_total),
+            std_error = sd(chronic_condition_total) / sqrt(n_patients))
+```
+
+### Create a subset of group
+Create a subgroup that contains every field but managed so we can generate inital covariates (T-tests) for each of the variables between managed and not managed. 
+```{r}
+prop_cov <-prop[,c(-1)]
+```
+
+### Inital Covariates for all of my variables selected above
+A looping function that prints Welch's T-tests for all every variable.
+```{r, warning= FALSE}
+lapply(test[-1], function(x) t.test(x ~ test$managed))
+```
+
+
+### Logit Model of managed Against every other variable for significant variables.
+
+We can estimate the propensity score by running a logit regression model. Outcome variable has to be binary indicating a treatment status. You include covariates that are realted to treatement assignment and outcomes. I've removed variables above that I did not wish to include and use all the remaining. 
+```{r, message=FALSE, warning=FALSE}
+m_prop <- glm(managed ~ ., family = binomial(), data = test)
+summary(m_prop)
+```
+### Region of Common Support
+
+Historgrams of the esimtated propensity scores by target and controlled groups. 
+```{r}
+#Using this model to calculate propensity scores for each care managmement patients.
+prop_df <- data.frame(pr_score = predict(m_prop, type = "response"),
+                     managed = m_prop$model$managed)
+
+labs <- paste("Were you managed:", c("managed", "Not managed"))
+
+prop_df %>%
+  mutate(managed = ifelse(managed == 1, labs[1], labs[2])) %>%
+  ggplot(aes(x = pr_score)) +
+  geom_histogram(color = "white") +
+  facet_wrap(~managed) +
+  xlab("Probability of Being managed") +
+  theme_bw()
+```
+
+# Matching
+
+### MatchIt
+
+Match managed and not managed population by Nearest Neighbors methods. This will be our base mode. The summary of this model can give of something information on how good of a job we did at Matching. 
+```{r}
+mod_match <- matchit(managed ~ age + Marital_Status + gender_display + American_Indian + Asian + Black + Caucasian + Hispanic + Pacific_Islander + Unknown + Identified_Algorithm + chronic_condition_total + physical_condition_present + mental_condition_present + Pre_Emergency + Pre_Outpatient + Pre_Inpatient + Pre_Observation + Post_Emergency + Post_Outpatient + Post_Inpatient + Post_Observation, method = "nearest", data = prop)
+
+#summary(mod_match)
+```
+
+
+
+### Plot matching
+
+Method of visualizing results of match algorithm
+```{r}
+plot(mod_match)
+```
+### Turn MatchIt object into a dataframe
+
+```{r}
+prop_m <- match.data(mod_match)
+dim(prop_m)
+```
+
+### Use a smoother plot
+
+These plots are used to estimate the mean of each covariates by each treatment status at the value of each propensity score. 6 plots at a time to not overcrowd. The better the match the closer the plots will have to near equal means. 
+```{r}
+fn_bal <- function(prop, variable) {
+  prop$variable <- prop[, variable]
+  if (variable == 'w3income') prop$variable <- prop$variable / 10^3
+  prop$managed <- as.factor(prop$managed)
+  support <- c(min(prop$variable), max(prop$variable))
+  ggplot(prop, aes(x = distance, y = variable, color = managed)) +
+    geom_point(alpha = 0.2, size = 1.3) +
+    geom_smooth(method = "loess", se = F) +
+    xlab("Propensity score") +
+    ylab(variable) +
+    theme_bw() +
+    ylim(support)
+}
+
+library(gridExtra)
+grid.arrange(
+   fn_bal(prop_m, "Asian"),
+   fn_bal(prop_m, "Hispanic") + theme(legend.position = "none"),
+   fn_bal(prop_m, "Caucasian"),
+   fn_bal(prop_m, "American_Indian") + theme(legend.position = "none"),
+   fn_bal(prop_m, "Black"),
+   fn_bal(prop_m, "Pacific_Islander"),
+   nrow = 3, widths = c(1, 0.8)
+)
+
+```
+
+B) Actually plotting. 
+
+```{r}
+library(gridExtra)
+grid.arrange(
+  fn_bal(prop_m, "gender_display"),
+  fn_bal(prop_m, "Marital_Status"),
+  fn_bal(prop_m, "age"),
+  fn_bal(prop_m, "Identified_Algorithm"),
+  fn_bal(prop_m, "chronic_condition_total"),
+  fn_bal(prop_m, "physical_condition_present"),
+  fn_bal(prop_m, "mental_condition_present"),
+  nrow = 4, widths = c(1, 0.85)
+)
+```
+
+### Compare our covariate t.tests. 
+
+Out inital T-tests can be seen in the Results dataframe. Compare them side by side. We can see we did a good job at achieving balance, although not perfect for all covariates. 
+```{r}
+all_means <- test %>%
+  group_by(managed) %>%
+  summarise_all(funs(mean))
+
+all_means
+```
+
+### Measuring the Absolute Standardized Differences in Error
+```{r}
+error <- abs(all_means - as.list(all_means[1, ]))
+error <- error[-1,-c(1,24,25)]
+rowMeans(error)
+rowSums(error)
+```
+
+# Second Attempt with a custom model
+
+### Model 2: Optimal My Model
+```{r}
+mod_match2 <- matchit(managed ~ age + Marital_Status + gender_display + American_Indian + Asian + Black + Caucasian + Hispanic + Pacific_Islander + Unknown + Identified_Algorithm + chronic_condition_total + physical_condition_present + mental_condition_present + Pre_Emergency + Pre_Outpatient + Pre_Inpatient + Pre_Observation, method = "nearest", distance = 'probit', discard = 'both', restimate = TRUE, data = prop)
+```
+
+```{r}
+prop_m2 <- match.data(mod_match2)
+prop_m2 <- prop_m2[c(1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26)]
+
+summary(mod_match2,standardize = TRUE)
+```
+
+```{r}
+# Exposing matched pairs, like if Jeff wants it or something.....
+a<-data.frame(prop$empi_id,mod_match2$treat,mod_match2$weights)
+colnames(a)<-c("id_num","trt","weights")
+
+b<-as.data.frame(mod_match2$match.matrix)
+colnames(b)<-c("matched_unit")
+
+b$matched_unit<-as.numeric(as.character(b$matched_unit))
+b$treated_unit<-as.numeric(rownames(b))
+
+c<-b[!is.na(b$matched_unit),]
+c$match_num<-1:dim(c)[1]
+
+a[c$matched_unit,4]<-c$match_num
+a[c$treated_unit,4]<-c$match_num
+colnames(a)[4]<-"match_num"
+
+
+a<- a[!is.na(a$match_num),]
+d <- a[order(a$match_num),] 
+
+write.csv(d, file = "C:/users/DS049709/Desktop/Matches.csv")
+
+```
+
+
+```{r}
+all_means2 <- prop_m2 %>%
+  group_by(managed) %>%
+  summarise_all(funs(mean))
+
+all_means2
+```
+
+```{r}
+error2 <- abs(all_means2 - as.list(all_means2[1, ]))
+error2 <- error2[-1,-c(1,24,25,26)]
+rowMeans(error2)
+rowSums(error2)
+```
+
+###########
+
+```{r}
+head(summary(mod_match2, interactions = FALSE , standardize = TRUE, addlvariables = TRUE))
+```
+
+### Measuring Standard Error
+```{r}
+m.out <- matchit(managed ~ age + Marital_Status + gender_display + American_Indian + Asian + Black + Caucasian + Hispanic + Pacific_Islander + Unknown + Identified_Algorithm + chronic_condition_total + physical_condition_present + mental_condition_present + Pre_Emergency + Pre_Outpatient + Pre_Inpatient + Pre_Observation, method = "nearest", verbose = TRUE, distance = 'linear.logit', distance.options = list(maxit = 10000), discard = "treat", m.order ="largest",  data = prop_m2)
+
+zelig_se(obj = m.out, Y = prop_m$chronic_condition_total)
+
+lechner_se(obj = m.out, Y = prop_m$chronic_condition_total)
+```
+
+```{r}
+library(gridExtra)
+grid.arrange(
+  fn_bal(prop_m2, "gender_display"),
+  fn_bal(prop_m2, "Identified_Algorithm"),
+  fn_bal(prop_m2, "Pre_Observation"),
+  fn_bal(prop_m2, "Pre_Inpatient"),
+  fn_bal(prop_m2, "Pre_Outpatient"),
+  fn_bal(prop_m2, "chronic_condition_total"),
+  nrow = 3, widths = c(1, 0.85)
+)
+```
+# Jitter Plot
+```{r}
+plot(mod_match2, type = 'jitter', interactive = FALSE)
+```
+
+```{r}
+plot(mod_match2)
+```
+
+#Pre-Intervention
+```{r}
+ag_mean <- aggregate(. ~ managed, test, function(x) c(mean = mean(x)))
+ag_mean$Function <- "Mean"
+ag_sd <- aggregate(. ~ managed, test, function(x) c(sd = sd(x)))
+ag_sd$Function <- "SD"
+total <- rbind(ag_mean, ag_sd)
+total
+```
+### Post-Intervention
+```{r}
+ag_mean <- aggregate(. ~ managed, prop_m2, function(x) c(mean = mean(x)))
+ag_mean$Function <- "Mean"
+ag_sd <- aggregate(. ~ managed, prop_m2, function(x) c(sd = sd(x)))
+ag_sd$Function <- "SD"
+total_2 <- rbind(ag_mean, ag_sd)
+total_2
+```
+
+```{r}
+write.csv(prop_m2, file = "C:/users/DS049709/Desktop/MyData.csv")
+```
+
+# Difference in Difference
+
+### Transform and merge data frame
+```{r}
+did_m <- test[c(1,12,13,14,15,16,17,18,19,20,21,22,23)]
+```
+
+### Create 5 Algorithms 
+```{r}
+did_hra <- subset(prop_m2, Identified_Algorithm =='1')
+did_mat <- subset(prop_m2, Identified_Algorithm =='2')
+did_ped <- subset(prop_m2, Identified_Algorithm =='3')
+did_tran <- subset(prop_m2, Identified_Algorithm =='4')
+did_util <-subset(prop_m2, Identified_Algorithm =='5')
+did_manual <-subset(prop_m2, Identified_Algorithm =='0')
+```
+
+### Differences in Differences for Pre/Post Utilization Visits
+
+These units can be dicussed in like terms. Meaning number of visits an average pre or post person needs. 
+```{r}
+#Outpatient Visit
+(mean(prop_m2$Post_Outpatient[prop_m2$managed==1]) - mean(prop_m2$Pre_Outpatient[prop_m2$managed==1])) - (mean(prop_m2$Post_Outpatient[prop_m2$managed==0]) - mean(prop_m2$Pre_Outpatient[prop_m2$managed==0]))
+
+#Inpatient Visit 
+(mean(prop_m2$Post_Inpatient[prop_m2$managed==1]) - mean(prop_m2$Pre_Inpatient[prop_m2$managed==1])) - (mean(prop_m2$Post_Inpatient[prop_m2$managed==0]) - mean(prop_m2$Pre_Inpatient[prop_m2$managed==0]))
+
+#Observation Visit
+(mean(prop_m2$Post_Observation[prop_m2$managed==1]) - mean(prop_m2$Pre_Observation[prop_m2$managed==1])) - (mean(prop_m2$Post_Observation[prop_m2$managed==0]) - mean(prop_m2$Pre_Observation[prop_m2$managed==0]))
+
+#Emergency
+(mean(prop_m2$Post_Emergency[prop_m2$managed==1]) - mean(prop_m2$Pre_Emergency[prop_m2$managed==1])) - (mean(prop_m2$Post_Emergency[prop_m2$managed==0]) - mean(prop_m2$Pre_Emergency[prop_m2$managed==0]))
+```
+
+### By Algorithm
+#High-Risk Adult and Senior
+
+```{r}
+#Outpatient Visit
+(mean(did_hra$Post_Outpatient[did_hra$managed==1]) - mean(did_hra$Pre_Outpatient[did_hra$managed==1])) - (mean(did_hra$Post_Outpatient[did_hra$managed==0]) - mean(did_hra$Pre_Outpatient[did_hra$managed==0]))
+
+#Inpatient Visit 
+(mean(did_hra$Post_Inpatient[did_hra$managed==1]) - mean(did_hra$Pre_Inpatient[did_hra$managed==1])) - (mean(did_hra$Post_Inpatient[did_hra$managed==0]) - mean(did_hra$Pre_Inpatient[did_hra$managed==0]))
+
+#Observation Visit
+(mean(did_hra$Post_Observation[did_hra$managed==1]) - mean(did_hra$Pre_Observation[did_hra$managed==1])) - (mean(did_hra$Post_Observation[did_hra$managed==0]) - mean(did_hra$Pre_Observation[did_hra$managed==0]))
+
+#Emergency
+(mean(did_hra$Post_Emergency[did_hra$managed==1]) - mean(did_hra$Pre_Emergency[did_hra$managed==1])) - (mean(did_hra$Post_Emergency[did_hra$managed==0]) - mean(did_hra$Pre_Emergency[did_hra$managed==0]))
+```
+
+# High-Risk Maternity
+```{r}
+#Outpatient Visit
+(mean(did_mat$Post_Outpatient[did_mat$managed==1]) - mean(did_mat$Pre_Outpatient[did_mat$managed==1])) - (mean(did_mat$Post_Outpatient[did_mat$managed==0]) - mean(did_mat$Pre_Outpatient[did_mat$managed==0]))
+
+#Inpatient Visit 
+(mean(did_mat$Post_Inpatient[did_mat$managed==1]) - mean(did_mat$Pre_Inpatient[did_mat$managed==1])) - (mean(did_mat$Post_Inpatient[did_mat$managed==0]) - mean(did_mat$Pre_Inpatient[did_mat$managed==0]))
+
+#Observation Visit
+(mean(did_mat$Post_Observation[did_mat$managed==1]) - mean(did_mat$Pre_Observation[did_mat$managed==1])) - (mean(did_mat$Post_Observation[did_mat$managed==0]) - mean(did_mat$Pre_Observation[did_mat$managed==0]))
+
+#Emergency
+(mean(did_mat$Post_Emergency[did_mat$managed==1]) - mean(did_mat$Pre_Emergency[did_mat$managed==1])) - (mean(did_mat$Post_Emergency[did_mat$managed==0]) - mean(did_mat$Pre_Emergency[did_mat$managed==0]))
+```
+
+#High-Risk Peds
+```{r}
+#Outpatient Visit
+(mean(did_ped$Post_Outpatient[did_ped$managed==1]) - mean(did_ped$Pre_Outpatient[did_ped$managed==1])) - (mean(did_ped$Post_Outpatient[did_ped$managed==0]) - mean(did_ped$Pre_Outpatient[did_ped$managed==0]))
+
+#Inpatient Visit 
+(mean(did_ped$Post_Inpatient[did_ped$managed==1]) - mean(did_ped$Pre_Inpatient[did_ped$managed==1])) - (mean(did_ped$Post_Inpatient[did_ped$managed==0]) - mean(did_ped$Pre_Inpatient[did_ped$managed==0]))
+
+#Observation Visit
+(mean(did_ped$Post_Observation[did_ped$managed==1]) - mean(did_ped$Pre_Observation[did_ped$managed==1])) - (mean(did_ped$Post_Observation[did_ped$managed==0]) - mean(did_ped$Pre_Observation[did_ped$managed==0]))
+
+#Emergency
+(mean(did_ped$Post_Emergency[did_ped$managed==1]) - mean(did_ped$Pre_Emergency[did_ped$managed==1])) - (mean(did_ped$Post_Emergency[did_ped$managed==0]) - mean(did_ped$Pre_Emergency[did_ped$managed==0]))
+```
+
+#Transitions of Care
+```{r}
+#Outpatient Visit
+(mean(did_tran$Post_Outpatient[did_tran$managed==1]) - mean(did_tran$Pre_Outpatient[did_tran$managed==1])) - (mean(did_tran$Post_Outpatient[did_tran$managed==0]) - mean(did_tran$Pre_Outpatient[did_tran$managed==0]))
+
+#Inpatient Visit 
+(mean(did_tran$Post_Inpatient[did_tran$managed==1]) - mean(did_tran$Pre_Inpatient[did_tran$managed==1])) - (mean(did_tran$Post_Inpatient[did_tran$managed==0]) - mean(did_tran$Pre_Inpatient[did_tran$managed==0]))
+
+#Observation Visit
+(mean(did_tran$Post_Observation[did_tran$managed==1]) - mean(did_tran$Pre_Observation[did_tran$managed==1])) - (mean(did_tran$Post_Observation[did_tran$managed==0]) - mean(did_tran$Pre_Observation[did_tran$managed==0]))
+
+#Emergency
+(mean(did_tran$Post_Emergency[did_tran$managed==1]) - mean(did_tran$Pre_Emergency[did_tran$managed==1])) - (mean(did_tran$Post_Emergency[did_tran$managed==0]) - mean(did_tran$Pre_Emergency[did_tran$managed==0]))
+```
+
+#Utilization Coordination
+```{r}
+#Outpatient Visit
+(mean(did_util$Post_Outpatient[did_util$managed==1]) - mean(did_util$Pre_Outpatient[did_util$managed==1])) - (mean(did_util$Post_Outpatient[did_util$managed==0]) - mean(did_util$Pre_Outpatient[did_util$managed==0]))
+
+#Inpatient Visit 
+(mean(did_util$Post_Inpatient[did_util$managed==1]) - mean(did_util$Pre_Inpatient[did_util$managed==1])) - (mean(did_util$Post_Inpatient[did_util$managed==0]) - mean(did_util$Pre_Inpatient[did_util$managed==0]))
+
+#Observation Visit
+(mean(did_util$Post_Observation[did_util$managed==1]) - mean(did_util$Pre_Observation[did_util$managed==1])) - (mean(did_util$Post_Observation[did_util$managed==0]) - mean(did_util$Pre_Observation[did_util$managed==0]))
+
+#Emergency
+(mean(did_util$Post_Emergency[did_util$managed==1]) - mean(did_util$Pre_Emergency[did_util$managed==1])) - (mean(did_util$Post_Emergency[did_util$managed==0]) - mean(did_util$Pre_Emergency[did_util$managed==0]))
+```
+
+#Manual
+```{r}
+#Outpatient Visit
+(mean(did_manual$Post_Outpatient[did_manual$managed==1]) - mean(did_manual$Pre_Outpatient[did_manual$managed==1])) - (mean(did_manual$Post_Outpatient[did_manual$managed==0]) - mean(did_manual$Pre_Outpatient[did_manual$managed==0]))
+
+#Inpatient Visit 
+(mean(did_manual$Post_Inpatient[did_manual$managed==1]) - mean(did_manual$Pre_Inpatient[did_manual$managed==1])) - (mean(did_manual$Post_Inpatient[did_manual$managed==0]) - mean(did_manual$Pre_Inpatient[did_manual$managed==0]))
+
+#Observation Visit
+(mean(did_manual$Post_Observation[did_manual$managed==1]) - mean(did_manual$Pre_Observation[did_manual$managed==1])) - (mean(did_manual$Post_Observation[did_manual$managed==0]) - mean(did_manual$Pre_Observation[did_manual$managed==0]))
+
+#Emergency
+(mean(did_manual$Post_Emergency[did_manual$managed==1]) - mean(did_manual$Pre_Emergency[did_manual$managed==1])) - (mean(did_manual$Post_Emergency[did_manual$managed==0]) - mean(did_manual$Pre_Emergency[did_manual$managed==0]))
+```
+
+#Clean up data to Re-arrange
+```{r}
+did_pre <- did_m[c(1,2,6,7,8,9)]
+did_pre$time <- 0
+did_post<- did_m[c(1,2,10,11,12,13)]
+did_post$time <- 1
+
+#Rename a bunch of columns in order to Rbind
+colnames(did_post)[colnames(did_post)=="Post_Outpatient"] <- "Outpatient"
+colnames(did_post)[colnames(did_post)=="Post_Emergency"] <- "Emergency"
+colnames(did_post)[colnames(did_post)=="Post_Inpatient"] <- "Inpatient"
+colnames(did_post)[colnames(did_post)=="Post_Observation"] <- "Observation"
+colnames(did_post)[colnames(did_post)=="managedNA"] <- "managed"
+
+colnames(did_pre)[colnames(did_pre)=="Pre_Outpatient"] <- "Outpatient"
+colnames(did_pre)[colnames(did_pre)=="Pre_Emergency"] <- "Emergency"
+colnames(did_pre)[colnames(did_pre)=="Pre_Inpatient"] <- "Inpatient"
+colnames(did_pre)[colnames(did_pre)=="Pre_Observation"] <- "Observation"
+colnames(did_pre)[colnames(did_pre)=="managedNA"] <- "managed"
+
+did_total <- rbind(did_pre,did_post)
+```
+
+```{r}
+HRA <- did_total[did_total$Identified_Algorithm == 1, ]
+MAT <- did_total[did_total$Identified_Algorithm == 2, ]
+PED <- did_total[did_total$Identified_Algorithm == 3, ]
+TRAN <- did_total[did_total$Identified_Algorithm == 4, ]
+UTIL <- did_total[did_total$Identified_Algorithm == 5, ]
+MAN <- did_total[did_total$Identified_Algorithm == 0, ]
+```
+
+# Linear Regression
+```{r}
+did_In <- lm(Inpatient ~ time + managed + time*managed, data = MAN)
+summary(did_In)
+```
+
+
+```{r}
+did_Out <- lm(Outpatient ~ time + managed + time*managed, data = UTIL)
+summary(did_Out)
+```
+
+```{r}
+did_Emer <- lm(Emergency ~ time + managed + time*managed, data = MAN)
+summary(did_Emer)
+```
+
+```{r}
+did_Out <- lm(Outpatient ~ time + managed + time*managed, data = did_total)
+summary(did_Out)
+```
